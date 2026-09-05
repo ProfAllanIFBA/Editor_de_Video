@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from IPython.display import HTML, display
 
-__version__ = "6.9.3"
+__version__ = "6.9.4"
 
 
 def _caminho_padrao_transcricao(arquivo: str | Path) -> Path:
@@ -360,23 +360,38 @@ def criar_preview_web(
     print("Criando uma cópia compatível com o navegador...")
     print(f"Saída: {saida.name}")
 
-    filtros: list[str] = []
+    # O libx264 + yuv420p exige dimensões pares. Alguns MP4 de celular/
+    # mensageiros anunciam dimensões visíveis ímpares por crop do H.264.
+    # O preview precisa normalizar isso antes da recodificação.
+    info = informacoes_video(entrada)
+    w, h = int(info["largura"]), int(info["altura"])
+    novo_w, novo_h = w, h
+
     if lado_maximo is not None and int(lado_maximo) > 0:
-        info = informacoes_video(entrada)
-        w, h = int(info["largura"]), int(info["altura"])
         maior = max(w, h)
         if maior > int(lado_maximo):
             fator = float(lado_maximo) / float(maior)
-            novo_w = max(2, int(round((w * fator) / 2.0) * 2))
-            novo_h = max(2, int(round((h * fator) / 2.0) * 2))
-            filtros.append(f"scale={novo_w}:{novo_h}")
+            novo_w = max(2, int(round(w * fator)))
+            novo_h = max(2, int(round(h * fator)))
+
+    # Garante 4:2:0 válido sem distorção perceptível (no máximo 1 px removido).
+    novo_w = max(2, novo_w - (novo_w % 2))
+    novo_h = max(2, novo_h - (novo_h % 2))
+
+    filtros: list[str] = []
+    if novo_w != w or novo_h != h:
+        filtros.append(f"scale={novo_w}:{novo_h}")
 
     comando = [
         "ffmpeg",
         "-y",
+        "-hide_banner",
+        "-fflags", "+genpts",
         "-i", str(entrada),
         "-map", "0:v:0",
         "-map", "0:a:0?",
+        "-sn",
+        "-dn",
     ]
     if filtros:
         comando += ["-vf", ",".join(filtros)]
@@ -385,16 +400,49 @@ def criar_preview_web(
         "-preset", "veryfast",
         "-crf", str(int(crf)),
         "-pix_fmt", "yuv420p",
-        "-fps_mode", "passthrough",
+        # Não usamos -fps_mode passthrough aqui. Em alguns builds do Colab
+        # e em arquivos com timestamps irregulares essa opção pode abortar
+        # a geração do MP4. O FFmpeg mantém a cadência adequada sozinho.
         "-c:a", "aac",
         "-b:a", str(bitrate_audio),
+        "-max_muxing_queue_size", "4096",
+        "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
         str(saida),
     ]
 
-    subprocess.run(comando, check=True)
+    if saida.exists():
+        try:
+            saida.unlink()
+        except OSError:
+            pass
 
-    print("Cópia de visualização criada.")
+    resultado = subprocess.run(
+        comando,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if resultado.returncode != 0:
+        # Não devolve um CalledProcessError opaco: mostra a parte útil do FFmpeg.
+        try:
+            if saida.exists():
+                saida.unlink()
+        except OSError:
+            pass
+        linhas = (resultado.stderr or "").strip().splitlines()
+        detalhe = "\n".join(linhas[-35:]) if linhas else "FFmpeg não forneceu detalhes."
+        raise RuntimeError(
+            "Não foi possível criar o preview do navegador.\n"
+            f"Entrada: {entrada.name} ({w}x{h})\n"
+            f"Preview tentado: {novo_w}x{novo_h}\n"
+            "Detalhes do FFmpeg:\n" + detalhe
+        )
+
+    if not saida.exists() or saida.stat().st_size == 0:
+        raise RuntimeError("O FFmpeg terminou sem criar um preview válido.")
+
+    print(f"Cópia de visualização criada: {novo_w}x{novo_h}")
     return saida
 
 
@@ -1900,7 +1948,7 @@ def marcador_cortes(
     legendas: bool = True,
 ) -> None:
     """
-    Marcador v6.9.3 para Jupyter e Google Colab.
+    Marcador v6.9.4 para Jupyter e Google Colab.
 
     Mantém os recursos da v5 e acrescenta:
       - edição de palavras da transcrição preservando timestamps;
